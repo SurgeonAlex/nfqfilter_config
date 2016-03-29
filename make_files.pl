@@ -5,17 +5,21 @@
 
 use strict;
 use warnings;
+use utf8;
 use Config::Simple;
 use DBI;
 use File::Basename;
 use URI;
-use Net::Nslookup;
 use POSIX;
-use Digest::MD5;
+use Digest::MD5 qw (md5);
 use Log::Log4perl;
 use Net::IP qw(:PROC);
+use Encode;
 
-use utf8;
+
+binmode(STDOUT,':utf8');
+binmode(STDERR,':utf8');
+
 my $dir = File::Basename::dirname($0);
 
 my $Config = {};
@@ -39,6 +43,7 @@ my $urls_file = $Config->{'APP.urls'} || "";
 my $ssls_file = $Config->{'APP.ssls'} || "";
 my $hosts_file = $Config->{'APP.hosts'} || "";
 my $protos_file = $Config->{'APP.protocols'} || "";
+my $ssls_ips_file = $Config->{'APP.ssls_ips'} || "";
 my $domains_ssl = $Config->{'APP.domains_ssl'} || "false";
 $domains_ssl = lc($domains_ssl);
 
@@ -62,16 +67,17 @@ my $https=0;
 my $total_entry=0;
 my %ip_s;
 my %ip_s_null;
+my %already_out;
 
 my $domains_file_hash_old=get_md5_sum($domains_file);
 my $urls_file_hash_old=get_md5_sum($urls_file);
 my $ssl_host_file_hash_old=get_md5_sum($ssls_file);
 my $net_file_hash_old=get_md5_sum($bgpd_file);
 
-open (my $DOMAINS_FILE, ">",$domains_file) or die "Could not open file '$domains_file' $!";
-open (my $URLS_FILE, ">",$urls_file) or die "Could not open file '$urls_file' $!";
-open (my $SSL_HOST_FILE, ">",$ssls_file) or die "Could not open file '$ssls_file' $!";
-
+open (my $DOMAINS_FILE, ">",$domains_file) or die "Could not open DOMAINS '$domains_file' file: $!";
+open (my $URLS_FILE, ">",$urls_file) or die "Could not open URLS '$urls_file' file: $!";
+open (my $SSL_HOST_FILE, ">",$ssls_file) or die "Could not open SSL hosts '$ssls_file' file: $!";
+open (my $SSL_IPS_FILE, ">", $ssls_ips_file) or die "Could not open SSL ips '$ssls_ips_file' file: $!";
 
 my $cmd = "$vtysh -c 'show run'";
 my $show_run=`$cmd`;
@@ -98,6 +104,7 @@ my @http_add_ports;
 my @https_add_ports;
 
 my %ssl_hosts;
+my %ssl_ip;
 
 my $sth = $dbh->prepare("SELECT * FROM zap2_domains");
 $sth->execute;
@@ -114,6 +121,13 @@ while (my $ips = $sth->fetchrow_hashref())
 		next if(defined $ssl_hosts{$domain_canonical});
 		$ssl_hosts{$domain_canonical}=1;
 		print $SSL_HOST_FILE "$domain_canonical\n";
+		my @ssl_ips=get_ips_for_record_id($ips->{record_id});
+		foreach my $ip (@ssl_ips)
+		{
+			next if(defined $ssl_ip{$ip});
+			$ssl_ip{$ip}=1;
+			print $SSL_IPS_FILE "$ip","\n";
+		}
 	}
 }
 $sth->finish();
@@ -154,6 +168,13 @@ while (my $ips = $sth->fetchrow_hashref())
 			$logger->info("Adding $port to https protocol");
 			push(@https_add_ports,$port);
 		}
+		my @ssl_ips=get_ips_for_record_id($ips->{record_id});
+		foreach my $ip (@ssl_ips)
+		{
+			next if(defined $ssl_ip{$ip});
+			$ssl_ip{$ip}=1;
+			print $SSL_IPS_FILE "$ip","\n";
+		}
 		next;
 	}
 	if($port ne "80")
@@ -168,12 +189,21 @@ while (my $ips = $sth->fetchrow_hashref())
 	my $url11=$url1->canonical();
 
 	$url11 =~ s/^http\:\/\///;
+	$url2 =~ s/^http\:\/\///;
 
 	# убираем любое упоминание о фрагменте... оно не нужно
 	$url11 =~ s/^(.*)\#(.*)$/$1/g;
+	$url2 =~ s/^(.*)\#(.*)$/$1/g;
 
-	print $URLS_FILE "$url11\n";
-	make_special_chars($url11);
+	$url2 .= "/" if($url2 !~ /\//);
+
+	insert_to_url($url11);
+	if($url2 ne $url11)
+	{
+#		print "insert original url $url2\n";
+		insert_to_url($url2);
+	}
+	make_special_chars($url11,$url1->as_iri());
 }
 $sth->finish();
 
@@ -196,10 +226,6 @@ while (my $ips = $sth->fetchrow_hashref())
 	$ip_s_null{$ip}=1;
 }
 $sth->finish();
-
-
-parse_our_blacklist($Config->{'APP.blacklist'} || "");
-
 
 if(!$update_soft_quagga)
 {
@@ -281,10 +307,9 @@ close $URLS_FILE;
 close $SSL_HOST_FILE;
 close $HOSTS_FILE;
 close $PROTOS_FILE;
+close $SSL_IPS_FILE;
 
 $dbh->disconnect();
-
-
 
 my $domains_file_hash=get_md5_sum($domains_file);
 my $urls_file_hash=get_md5_sum($urls_file);
@@ -315,72 +340,6 @@ if($domains_file_hash ne $domains_file_hash_old || $urls_file_hash ne $urls_file
 		$logger->error("Nfqfilter restart failed: $!");
 	} else {
 		$logger->info("Nfqfilter successfully restarted!");
-	}
-}
-
-
-sub parse_our_blacklist
-{
-	my $file=shift;
-	my @urls;
-	if(open (my $our_f,"<",$file))
-	{
-		while(my $line=<$our_f>)
-		{
-			chomp $line;
-			push(@urls,$line);
-		}
-		close($our_f);
-	} else {
-		warn "Could not open file '$file' $!";
-		return ;
-	}
-#	print $NET_FILE " ! ip's from our blacklist\n";
-	foreach my $url (@urls)
-	{
-		my $url1=new URI($url);
-		my $scheme=$url1->scheme();
-		if($scheme !~ /http/ && $scheme !~ /https/)
-		{
-			$logger->warn("bad scheme for: $url. Skip it.");
-			next;
-		}
-		my $host=$url1->host();
-		my $path=$url1->path();
-		my $query=$url1->query();
-		my $port=$url1->port();
-		my @adrs = ();
-		eval
-		{
-			@adrs = nslookup(domain => $host, server => @resolvers, timeout => 4 );
-		};
-#		print $NET_FILE " ! host: $host\n" if(@adrs);
-		foreach my $ip (@adrs)
-		{
-			next if(defined $ip_s{$ip});
-			next if($ip =~ /89.250.0./);
-			$ip_s{$ip}=1;
-			#print $NET_FILE " network $ip/32\n";
-		}
-		if($scheme eq 'https')
-		{
-			next if(defined $ssl_hosts{$host});
-			$ssl_hosts{$host}=1;
-			print $SSL_HOST_FILE "$host\n";
-			if($port ne "443")
-			{
-				$logger->info("Need to add another port for ssl $port");
-			}
-			next;
-		}
-		if($port ne "80")
-		{
-			$logger->info("Need to add another port for http $port");
-		}
-		my $url11=$url1->canonical();
-		$url11 =~ s/^http\:\/\///;
-		print $URLS_FILE "$url11\n";
-		make_special_chars($url11);
 	}
 }
 
@@ -563,18 +522,66 @@ sub analyse_quagga_networks
 	}
 }
 
-sub make_special_chars
+sub _encode_sp
 {
 	my $url=shift;
-	my $orig_url=$url;
 	$url =~ s/\%7C/\|/g;
 	$url =~ s/\+/\%20/g;
 	$url =~ s/\%5B/\[/g;
 	$url =~ s/\%5D/\]/g;
 	$url =~ s/\%3A/\:/g;
+	return $url;
+}
+
+sub make_special_chars
+{
+	my $url=shift;
+	my $orig_rkn=shift;
+	my $orig_url=$url;
+	$url = _encode_sp($url);
 	if($url ne $orig_url)
 	{
 		$logger->debug("Write changed url to the file");
-		print $URLS_FILE "$url\n";
+		insert_to_url($url);
 	}
+	if($url =~ /\%27/)
+	{
+		$url =~ s/\%27/\'/g;
+		$logger->debug("Write changed url (%27) to the file");
+		insert_to_url($url);
+	}
+	if($url =~ /\%5C/)
+	{
+		$url =~ s/\%5C/\//g;
+		$logger->debug("Write changed url (slashes) to the file");
+		insert_to_url($url);
+	}
+	if($orig_rkn && $orig_rkn =~ /[\x{0080}-\x{FFFF}]/)
+	{
+		return if($orig_rkn =~ /^http\:\/\/[а-я]/i || $orig_rkn =~ /^http\:\/\/www\.[а-я]/i);
+		$orig_rkn =~ s/^http\:\/\///;
+		$orig_rkn =~ s/^(.*)\#(.*)$/$1/g;
+		my $str = encode("utf8", $orig_rkn);
+		Encode::from_to($str, 'utf-8','windows-1251');
+		if($str ne $orig_rkn)
+		{
+			$logger->debug("Write url in cp1251 to the file");
+			print $URLS_FILE $str."\n";
+		}
+		if($url ne $orig_rkn)
+		{
+			$logger->debug("Write changed url to the file");
+			insert_to_url($orig_rkn);
+		}
+	}
+}
+
+sub insert_to_url
+{
+	my $url=shift;
+	my $encoded=encode("utf8", $url);
+	my $sum = md5($encoded);
+	return if(defined $already_out{$sum});
+	$already_out{$sum}=1;
+	print $URLS_FILE $encoded."\n";
 }
